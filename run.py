@@ -57,13 +57,16 @@ def run_test(test_file: str, test_name: str, *, env_extra=None, warmup: int, run
         print(runtimes)
 
     if all(r == 0.0 for r in runtimes):
-        return 0.0
+        return 0.0, 0.0, 0.0
 
+    min_ = min(runtimes)
     mean, stddev = statistics.mean(runtimes), statistics.stdev(runtimes) if len(runtimes) > 1 else 0.0
+    max_ = max(runtimes)
+    
     cv = stddev / mean
     if cv > 0.03:
         warnings.warn(f"High coefficient of variation detected: {mean=}, {stddev=}, {cv=}")
-    return mean
+    return min_, mean, max_
 
 
 def run_cpython(*args, **kwargs):
@@ -95,16 +98,20 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
                 continue
 
             print(f"[{idx}/{len(tests)}] Running {test}...")
-            base = run_cpython(abs_path, test, **kwargs)
-            dynamo = run_dynamo(abs_path, test, **kwargs)
+            base_min, base_mean, base_max = run_cpython(abs_path, test, **kwargs)
+            dynamo_min, dynamo_mean, dynamo_max = run_dynamo(abs_path, test, **kwargs)
 
             results.append(
                 {
                     "test_file": test_file,
                     "test": test,
-                    "base_time": base,
-                    "dynamo_time": dynamo,
-                    "ratio": dynamo / base if base and dynamo else None
+                    "base_time_min": base_min,
+                    "base_time_mean": base_mean,
+                    "base_time_max": base_max,
+                    "dynamo_time_min": dynamo_min,
+                    "dynamo_time_mean": dynamo_mean,
+                    "dynamo_time_max": dynamo_max,
+                    "ratio": dynamo_mean / base_mean if base_mean and dynamo_mean else None
                 },
             )
 
