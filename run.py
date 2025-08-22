@@ -121,7 +121,7 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
     print(df)
 
     if save:
-        df.to_csv(save, index=False)
+        df.sort_values(by="ratio", ascending=False).to_csv(save, index=False)
 
 
 def get_test_files() -> list[str]:
