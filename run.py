@@ -11,6 +11,8 @@ import pathlib
 import pandas as pd
 import rich
 
+from datetime import date
+
 
 version = sys.version_info
 PY_VER = f"{version.major}_{version.minor}"
@@ -82,6 +84,12 @@ def skip_test(test_file: str, test_name: str):
     file = PATH_TO_DYNAMO_FAILURES / f"CPython{PYVER}-{module}-{test_name}"
     return file.exists()
 
+def get_commit_hash():
+    return subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%h"],  # %h = short hash
+        cwd=PATH_TO_PYTORCH,
+        text=True
+    ).strip()
 
 def main(test_files: list[str], *, save: str | None, **kwargs):
     results = []
@@ -121,7 +129,13 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
     print(df)
 
     if save:
-        df.sort_values(by="ratio", ascending=False).to_csv(save, index=False)
+        # prepend name by git commit and user date
+        commit = get_commit_hash()
+        today = date.today()
+        d = f"{today.year}-{today.month}-{today.day}"
+        name = f"result_{d}_{commit}.csv"
+        p = (pathlib.Path("results") / name).resolve()
+        df.sort_values(by="ratio", ascending=False).to_csv(p, index=False)
 
 
 def get_test_files() -> list[str]:
@@ -147,7 +161,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose output")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup runs for hyperfine")
     parser.add_argument("--runs", type=int, default=3, help="Number of runs for hyperfine")
-    parser.add_argument("--save", type=str, default=None, help="Path to save the results")
+    parser.add_argument("--save", action="store_true", default=False, help="Save the result")
     args = parser.parse_args()
 
     if args.list:
