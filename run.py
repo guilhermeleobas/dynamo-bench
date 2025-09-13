@@ -52,7 +52,13 @@ def run_test(test_file: str, test_name: str, *, env_extra=None, warmup: int, run
         "run.bash",
     ]
 
-    out = subprocess.run(cmd, env=env, check=True, text=True, stderr=subprocess.PIPE).stderr
+    try:
+        out = subprocess.run(cmd, env=env, check=True, text=True, stderr=subprocess.PIPE).stderr
+    except subprocess.CalledProcessError as e:
+        breakpoint()
+        print(e)
+        raise
+        
     matches = re.findall(r"Ran \d+ test.* in ([0-9.]+)s", out)
     runtimes = [float(m) for m in matches][warmup:]  # Skip warmup runs
     if verbose:
