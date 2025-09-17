@@ -1,0 +1,24 @@
+{
+  "execution": {
+    "benchmark_parameters": {
+      "warmup": 1,
+      "runs": 4
+    },
+    "run_date": "2025-09-17T03:10:23.657489Z",
+    "commit_hash": "fa919feab6a"
+  },
+  "hardware": {
+    "cpu_model": "x86_64",
+    "num_cores": 12,
+    "num_threads": 24,
+    "ram_gb": 67.3
+  },
+  "system": {
+    "os_name": "Linux",
+    "os_version": "#79~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 15 16:54:53 UTC 2"
+  },
+  "software": {
+    "python_version": "3.13.2",
+    "torch_version": "2.10.0a0+git1e9ddf5"
+  }
+}
