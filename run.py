@@ -174,8 +174,6 @@ set -e
             continue
         else:
             non_skipped_tests.append(test_name)
-            if len(non_skipped_tests) > 1:
-                break
 
     n_tests = len(non_skipped_tests)
     for idx, test_name in enumerate(non_skipped_tests):
