@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import warnings
+import itertools
+import collections
 import statistics
 import re
 import os
@@ -10,6 +12,7 @@ import unittest
 import pathlib
 import pandas as pd
 import rich
+import tempfile
 
 from datetime import date
 from rich.table import Table
@@ -44,66 +47,104 @@ def discover_tests(test_file):
     return tests
 
 
-def run_test(
+def compute_min_max_mean(data: list[float]) -> tuple[float, float, float]:
+    if all(r == 0.0 for r in data):
+        return 0.0, 0.0, 0.0
+
+    min_ = min(data)
+    mean, stddev = (
+        statistics.mean(data),
+        statistics.stdev(data) if len(data) > 1 else 0.0,
+    )
+    max_ = max(data)
+
+    cv = stddev / mean
+    if cv > 0.03:
+        warnings.warn(f"High coefficient of variation detected: {mean=}, {stddev=}, {cv=}")
+    return min_, mean, max_
+
+
+def run_bash_script(script: str, verbose=False, env_extra=None) -> list[float]:
+    if verbose:
+        print(script)
+
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as f:
+        f.write(script)
+
+    env = os.environ.copy()
+    env.update(env_extra or {})
+
+    try:
+        out = subprocess.run(
+            ["bash", f.name], env=env, check=True, text=True, stderr=subprocess.PIPE
+        )
+    except subprocess.CalledProcessError as e:
+        print(e)
+        raise
+    matches = re.findall(r"Ran \d+ test.* in ([0-9.]+)s", out.stderr)
+    runtimes = [float(m) for m in matches]
+    return runtimes
+
+
+def run_tests(
     test_file: str,
-    test_name: str,
+    test_names: list[str],
     *,
     env_extra=None,
     warmup: int,
     runs: int,
     verbose: bool,
-) -> float:
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
+) -> dict[str, list[float]]:
+    assert isinstance(test_names, list)
+    assert isinstance(warmup, int)
+    assert isinstance(runs, int)
 
-    env["TEST_FILE"] = test_file
-    env["TEST_CASE"] = test_name
-    env["RUNS"] = str(runs + warmup)
+    test_file_path = os.path.join(PATH_TO_CPYTHON_TESTS, test_file)
+    total = len(test_names)
+    results = collections.defaultdict(list)
 
-    cmd = [
-        "bash",
-        "run.bash",
-    ]
+    non_skipped_tests = []
 
-    try:
-        out = subprocess.run(
-            cmd, env=env, check=True, text=True, stderr=subprocess.PIPE
-        ).stderr
-    except subprocess.CalledProcessError as e:
-        breakpoint()
-        print(e)
-        raise
+    bash_script = f"""
+#!/bin/bash
 
-    matches = re.findall(r"Ran \d+ test.* in ([0-9.]+)s", out)
-    runtimes = [float(m) for m in matches][warmup:]  # Skip warmup runs
-    if verbose:
-        print(runtimes)
+set -e
+"""
 
-    if all(r == 0.0 for r in runtimes):
-        return 0.0, 0.0, 0.0
+    for idx, test_name in enumerate(test_names):
+        if idx > 3:
+            break
 
-    min_ = min(runtimes)
-    mean, stddev = (
-        statistics.mean(runtimes),
-        statistics.stdev(runtimes) if len(runtimes) > 1 else 0.0,
-    )
-    max_ = max(runtimes)
+        results[test_name] = [0.0, 0.0, 0.0]
+        if skip_test(test_file, test_name):
+            print(f"Skipping test {test_name}...")
+            continue
+        else:
+            non_skipped_tests.append(test_name)
 
-    cv = stddev / mean
-    if cv > 0.03:
-        warnings.warn(
-            f"High coefficient of variation detected: {mean=}, {stddev=}, {cv=}"
-        )
-    return min_, mean, max_
+        bash_script += f"""
+echo "[{idx}/{total}] Running test {test_name}..."
+for i in $(seq 1 {warmup + runs}); do
+    python {test_file_path} {test_name}
+done
+"""
+    runtimes = run_bash_script(bash_script, verbose=verbose, env_extra=env_extra)
+    batched = itertools.batched(runtimes, warmup + runs)
+    for test_name, batch in zip(non_skipped_tests, batched):
+        assert len(batch) == warmup + runs
+
+        batch = batch[warmup:]  # Skip warmup runs
+        min_, mean, max_ = compute_min_max_mean(batch)
+        results[test_name] = [min_, mean, max_]
+    return results
 
 
 def run_cpython(*args, **kwargs):
-    return run_test(*args, **kwargs)
+    return run_tests(*args, **kwargs)
 
 
 def run_dynamo(*args, **kwargs):
-    return run_test(*args, env_extra={"PYTORCH_TEST_WITH_DYNAMO": "1"}, **kwargs)
+    return run_tests(*args, env_extra={"PYTORCH_TEST_WITH_DYNAMO": "1"}, **kwargs)
 
 
 def skip_test(test_file: str, test_name: str):
@@ -120,7 +161,7 @@ def get_commit_hash():
     ).strip()
 
 
-def main(test_files: list[str], *, save: str | None, **kwargs):
+def main(test_files: list[str], *, save: str | None, compare_with: str | None, **kwargs):
     results = []
 
     for test_file in test_files:
@@ -128,16 +169,14 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
         tests = discover_tests(abs_path)
 
         print(f"===== Test {test_file} =====")
+        cpython_results = run_cpython(test_file, tests, **kwargs)
+        dynamo_results = run_dynamo(test_file, tests, **kwargs)
 
-        for idx, test in enumerate(tests):
-            if skip_test(test_file, test):
-                print(f"[{idx}/{len(tests)}] Skipping test {test}...")
-                continue
+        assert len(cpython_results) == len(dynamo_results)
 
-            print(f"[{idx}/{len(tests)}] Running {test}...")
-            base_min, base_mean, base_max = run_cpython(abs_path, test, **kwargs)
-            dynamo_min, dynamo_mean, dynamo_max = run_dynamo(abs_path, test, **kwargs)
-
+        for test in cpython_results.keys():
+            base_min, base_mean, base_max = cpython_results[test]
+            dynamo_min, dynamo_mean, dynamo_max = dynamo_results[test]
             results.append(
                 {
                     "test_file": test_file,
@@ -154,10 +193,7 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
                 },
             )
 
-        print()
-
     df = pd.DataFrame(results)
-    print(df)
 
     if save:
         # prepend name by git commit and user date
@@ -167,6 +203,10 @@ def main(test_files: list[str], *, save: str | None, **kwargs):
         name = f"result_{d}_{commit}.csv"
         p = (pathlib.Path("results") / name).resolve()
         df.sort_values(by="ratio", ascending=False).to_csv(p, index=False)
+
+    if compare_with:
+        baseline = pd.read_csv(compare_with)
+        compare_dataframes(baseline, df, verbose=kwargs.get("verbose", False))
 
 
 def get_test_files() -> list[str]:
@@ -191,6 +231,10 @@ def compare_files(baseline, file2, verbose=False):
     """
     df1 = pd.read_csv(baseline)[["test_file", "test", "dynamo_time_mean"]]
     df2 = pd.read_csv(file2)[["test_file", "test", "dynamo_time_mean"]]
+    return compare_dataframes(df1, df2, verbose=verbose)
+
+
+def compare_dataframes(df1, df2, verbose=False):
 
     # Merge on test_file and test columns
     merged = pd.merge(df1, df2, on=["test_file", "test"], suffixes=("_1", "_2"))
@@ -260,8 +304,6 @@ def compare_files(baseline, file2, verbose=False):
 
     rich.print(
         f"""
-Assuming file 1 ('{baseline}') is baseline
-
 Summary:
     {n_tests} benchmarks run
     {n_faster} faster, {n_slower} slower, {n_same} same
@@ -304,6 +346,11 @@ if __name__ == "__main__":
         metavar=("FILE1", "FILE2"),
         help="Compare two result files",
     )
+    parser.add_argument(
+        "--compare_with",
+        type=str,
+        help="Compare the latest result with a given result file",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -316,6 +363,7 @@ if __name__ == "__main__":
             runs=args.runs,
             verbose=args.verbose,
             save=args.save,
+            compare_with=args.compare_with,
         )
     elif args.all:
         main(
@@ -324,6 +372,7 @@ if __name__ == "__main__":
             runs=args.runs,
             verbose=args.verbose,
             save=args.save,
+            compare_with=args.compare_with,
         )
     elif args.compare:
         compare_files(args.compare[0], args.compare[1], verbose=args.verbose)
