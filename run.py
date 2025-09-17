@@ -11,11 +11,16 @@ import subprocess
 import unittest
 import pathlib
 import pandas as pd
-import rich
 import tempfile
+import platform
+import psutil
+import torch
+import datetime
+import json
 
 from datetime import date
-from rich.table import Table
+from dataclasses import dataclass, field, asdict
+from compare import compare_dataframes
 
 
 version = sys.version_info
@@ -26,6 +31,55 @@ PATH_TO_DYNAMO_FAILURES = PATH_TO_PYTORCH / "test" / "dynamo_expected_failures"
 PATH_TO_CPYTHON_TESTS = (
     PATH_TO_PYTORCH / "test" / "dynamo" / "cpython" / PY_VER
 ).resolve()
+
+
+def get_commit_hash():
+    return subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%h"],  # %h = short hash
+        cwd=PATH_TO_PYTORCH,
+        text=True,
+    ).strip()
+
+
+@dataclass(frozen=True)
+class Hardware:
+    cpu_model: str = platform.processor()
+    num_cores: int = psutil.cpu_count(logical=False)
+    num_threads: int = psutil.cpu_count(logical=True)
+    ram_gb: float = round(psutil.virtual_memory().total / 1e9, 2)
+
+
+@dataclass(frozen=True)
+class System:
+    os_name: str = platform.system()
+    os_version: str = platform.version()
+
+
+@dataclass(frozen=True)
+class Software:
+    python_version: str = platform.python_version()
+    torch_version: str = torch.__version__
+
+
+@dataclass(frozen=True)
+class BenchmarkParameters:
+    warmup: int
+    runs: int
+
+
+@dataclass(frozen=True)
+class Execution:
+    benchmark_parameters: BenchmarkParameters
+    run_date: str = datetime.datetime.utcnow().isoformat() + "Z"
+    commit_hash: str = get_commit_hash()
+
+
+@dataclass(frozen=True)
+class Metadata:
+    execution: Execution
+    hardware: Hardware = field(default_factory=Hardware)
+    system: System = field(default_factory=System)
+    software: Software = field(default_factory=Software)
 
 
 def discover_tests(test_file):
@@ -47,7 +101,7 @@ def discover_tests(test_file):
     return tests
 
 
-def compute_min_max_mean(data: list[float]) -> tuple[float, float, float]:
+def compute_run_stats(data: list[float]) -> tuple[float, float, float]:
     if all(r == 0.0 for r in data):
         return 0.0, 0.0, 0.0
 
@@ -58,9 +112,12 @@ def compute_min_max_mean(data: list[float]) -> tuple[float, float, float]:
     )
     max_ = max(data)
 
+    threshold = 0.03
     cv = stddev / mean
-    if cv > 0.03:
-        warnings.warn(f"High coefficient of variation detected: {mean=}, {stddev=}, {cv=}")
+    if cv > threshold:
+        warnings.warn(
+            f"High coefficient of variation detected: {mean=}, {stddev=}, {cv=}"
+        )
     return min_, mean, max_
 
 
@@ -100,9 +157,7 @@ def run_tests(
     assert isinstance(runs, int)
 
     test_file_path = os.path.join(PATH_TO_CPYTHON_TESTS, test_file)
-    total = len(test_names)
     results = collections.defaultdict(list)
-
     non_skipped_tests = []
 
     bash_script = f"""
@@ -112,31 +167,53 @@ set -e
 """
 
     for idx, test_name in enumerate(test_names):
-        if idx > 3:
-            break
-
         results[test_name] = [0.0, 0.0, 0.0]
         if skip_test(test_file, test_name):
-            print(f"Skipping test {test_name}...")
+            if verbose:
+                print(f"Skipping test {test_name}")
             continue
         else:
             non_skipped_tests.append(test_name)
+            if len(non_skipped_tests) > 1:
+                break
 
+    n_tests = len(non_skipped_tests)
+    for idx, test_name in enumerate(non_skipped_tests):
         bash_script += f"""
-echo "[{idx}/{total}] Running test {test_name}..."
+echo "[{idx}/{n_tests}] Running test {test_name}"
 for i in $(seq 1 {warmup + runs}); do
     python {test_file_path} {test_name}
 done
 """
+
     runtimes = run_bash_script(bash_script, verbose=verbose, env_extra=env_extra)
     batched = itertools.batched(runtimes, warmup + runs)
     for test_name, batch in zip(non_skipped_tests, batched):
         assert len(batch) == warmup + runs
 
         batch = batch[warmup:]  # Skip warmup runs
-        min_, mean, max_ = compute_min_max_mean(batch)
+        min_, mean, max_ = compute_run_stats(batch)
         results[test_name] = [min_, mean, max_]
     return results
+
+
+def dump_result(df: pd.DataFrame):
+    commit = get_commit_hash()
+    today = date.today()
+    d = f"{today.year}-{today.month}-{today.day}"
+    name = f"result_{d}_{commit}.csv"
+    p = (pathlib.Path("results") / name).resolve()
+    df.sort_values(by="ratio", ascending=False).to_csv(p, index=False)
+
+
+def dump_metadata(*, warmup: int, runs: int, **kwargs):
+    params = BenchmarkParameters(warmup, runs)
+    execution = Execution(benchmark_parameters=params)
+    metadata = Metadata(execution=execution)
+    metadata_json = json.dumps(asdict(metadata), indent=2)
+    fname = f"{get_commit_hash()}_metadata.json"
+    with open(fname, "w") as f:
+        f.write(metadata_json)
 
 
 def run_cpython(*args, **kwargs):
@@ -153,15 +230,9 @@ def skip_test(test_file: str, test_name: str):
     return file.exists()
 
 
-def get_commit_hash():
-    return subprocess.check_output(
-        ["git", "log", "-1", "--pretty=%h"],  # %h = short hash
-        cwd=PATH_TO_PYTORCH,
-        text=True,
-    ).strip()
-
-
-def main(test_files: list[str], *, save: str | None, compare_with: str | None, **kwargs):
+def main(
+    test_files: list[str], *, save: str | None, compare_with: str | None, **kwargs
+):
     results = []
 
     for test_file in test_files:
@@ -196,17 +267,21 @@ def main(test_files: list[str], *, save: str | None, compare_with: str | None, *
     df = pd.DataFrame(results)
 
     if save:
-        # prepend name by git commit and user date
-        commit = get_commit_hash()
-        today = date.today()
-        d = f"{today.year}-{today.month}-{today.day}"
-        name = f"result_{d}_{commit}.csv"
-        p = (pathlib.Path("results") / name).resolve()
-        df.sort_values(by="ratio", ascending=False).to_csv(p, index=False)
+        # save result.csv
+        dump_result(df)
+        # save metadata
+        dump_metadata(**kwargs)
 
     if compare_with:
         baseline = pd.read_csv(compare_with)
-        compare_dataframes(baseline, df, verbose=kwargs.get("verbose", False))
+        hash_baseline = compare_with.split("_")[-1].strip(".csv")
+        compare_dataframes(
+            baseline,
+            df,
+            hash_baseline,
+            get_commit_hash(),
+            verbose=kwargs.get("verbose", False),
+        )
 
 
 def get_test_files() -> list[str]:
@@ -231,89 +306,9 @@ def compare_files(baseline, file2, verbose=False):
     """
     df1 = pd.read_csv(baseline)[["test_file", "test", "dynamo_time_mean"]]
     df2 = pd.read_csv(file2)[["test_file", "test", "dynamo_time_mean"]]
-    return compare_dataframes(df1, df2, verbose=verbose)
-
-
-def compare_dataframes(df1, df2, verbose=False):
-
-    # Merge on test_file and test columns
-    merged = pd.merge(df1, df2, on=["test_file", "test"], suffixes=("_1", "_2"))
-
-    # Calculate ratios
-    merged["mean_ratio"] = merged["dynamo_time_mean_2"] / merged["dynamo_time_mean_1"]
-    merged["faster"] = merged["mean_ratio"] < 1.0
-
-    if verbose:
-        rich.print(
-            merged[
-                [
-                    "test_file",
-                    "test",
-                    "dynamo_time_mean_1",
-                    "dynamo_time_mean_2",
-                    "mean_ratio",
-                    "faster",
-                ]
-            ]
-        )
-
-    merged.sort_values(by="mean_ratio", ascending=True, inplace=True)
-
-    n_tests = len(merged)
-    n_same = (merged["mean_ratio"] == 1.0).sum()
-    n_faster = merged["faster"].sum()
-    n_slower = n_tests - n_faster - n_same
-
-    geomean = statistics.geometric_mean(merged["mean_ratio"].dropna())
-
-    best_speedup = merged.mean_ratio.min()
-    best_speedup_test = merged.loc[merged.mean_ratio.idxmin()]["test"]
-    best_speedup_test_file = merged.loc[merged.mean_ratio.idxmin()]["test_file"]
-
-    worst_slowdown = merged.mean_ratio.max()
-    worst_slowdown_test = merged.loc[merged.mean_ratio.idxmax()]["test"]
-    worst_slowdown_test_file = merged.loc[merged.mean_ratio.idxmax()]["test_file"]
-
-    threshold = 0.01
-    if geomean > 1.0 + threshold:
-        geomean_str = "Tests are slower on average"
-    elif geomean < 1.0 - threshold:
-        geomean_str = "Tests are faster on average"
-    else:
-        geomean_str = "No overall change in speed"
-
-    tab = Table(title="Comparison Results")
-    tab.add_column("Benchmark", style="cyan", no_wrap=True)
-    tab.add_column("Baseline Time", style="white")
-    tab.add_column("New Time", style="white")
-    tab.add_column("Speedup/Slowdown", justify="right", style="white")
-
-    idx = 0
-    for entry in pd.concat([merged.head(10), merged.tail(10)]).itertuples():
-        benchmark = entry.test
-        baseline_time = f"{entry.dynamo_time_mean_1:.4f}s"
-        new_time = f"{entry.dynamo_time_mean_2:.4f}s"
-        color = "green" if entry.faster else "red"
-        ratio = f"[{color}]{entry.mean_ratio:.2f}x [/{color}]"
-        tab.add_row(benchmark, baseline_time, new_time, ratio)
-        idx += 1
-        if idx == 10:
-            tab.add_row("...", "...", "...", "...")
-
-    rich.print(tab)
-
-    rich.print(
-        f"""
-Summary:
-    {n_tests} benchmarks run
-    {n_faster} faster, {n_slower} slower, {n_same} same
-    Geomean ratio = {geomean:.2f}x
-    Best speedup = {best_speedup:.2f}x ({best_speedup_test_file} {best_speedup_test})
-    Worst slowdown = {worst_slowdown:.2f}x ({worst_slowdown_test_file} {worst_slowdown_test})
-
-    {geomean_str}
-"""
-    )
+    baseline_hash = baseline.split("_")[-1].strip(".csv")
+    new_hash = file2.split("_")[-1].strip(".csv")
+    return compare_dataframes(df1, df2, baseline_hash, new_hash, verbose=verbose)
 
 
 if __name__ == "__main__":
