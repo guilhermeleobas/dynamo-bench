@@ -1,0 +1,16 @@
+[project]
+name = "dynamo-bench"
+version = "0.1.0"
+description = "Simple tool to run and compare CPython tests on PyTorch Dynamo"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "argparse>=1.4.0",
+    "pandas>=2.3.2",
+    "psutil>=7.0.0",
+    "rich>=14.1.0",
+    "statistics>=1.0.3.5",
+]
+authors = [
+  {name = "Guilherme Leobas"},
+]

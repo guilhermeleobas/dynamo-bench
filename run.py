@@ -17,6 +17,8 @@ import psutil
 import torch
 import datetime
 import json
+import rich
+import time
 
 from datetime import date
 from dataclasses import dataclass, field, asdict
@@ -195,7 +197,7 @@ done
     return results
 
 
-def dump_result(df: pd.DataFrame):
+def save_result(df: pd.DataFrame):
     commit = get_commit_hash()
     today = date.today()
     d = f"{today.year}-{today.month}-{today.day}"
@@ -204,10 +206,15 @@ def dump_result(df: pd.DataFrame):
     df.sort_values(by="ratio", ascending=False).to_csv(p, index=False)
 
 
-def dump_metadata(*, warmup: int, runs: int, **kwargs):
+def get_metadata(*, warmup: int, runs: int, **kwargs) -> Metadata:
     params = BenchmarkParameters(warmup, runs)
     execution = Execution(benchmark_parameters=params)
     metadata = Metadata(execution=execution)
+    return metadata
+
+
+def save_metadata(*, warmup: int, runs: int, **kwargs):
+    metadata = get_metadata(warmup=warmup, runs=runs, **kwargs)
     metadata_json = json.dumps(asdict(metadata), indent=2)
     fname = f"{get_commit_hash()}_metadata.json"
     with open(fname, "w") as f:
@@ -228,18 +235,42 @@ def skip_test(test_file: str, test_name: str):
     return file.exists()
 
 
+def load_metadata(hash: str) -> dict:
+    p = f"{hash}_metadata.json"
+    if os.path.exists(p):
+        return json.load(open(p))
+    else:
+        return {}
+
+
 def main(
-    test_files: list[str], *, save: str | None, compare_with: str | None, **kwargs
+    test_files: list[str],
+    *,
+    save: bool,
+    test_case: str | None,
+    run_only_dynamo: bool = False,
+    compare_with: str | None,
+    **kwargs,
 ):
     results = []
 
     for test_file in test_files:
         abs_path = os.path.join(PATH_TO_CPYTHON_TESTS, test_file)
-        tests = discover_tests(abs_path)
+
+        if test_case:
+            discovered = discover_tests(abs_path)
+            assert test_case in discovered, f"{test_case} not found in {discovered}"
+            tests = [test_case]
+        else:
+            tests = discover_tests(abs_path)
 
         print(f"===== Test {test_file} =====")
-        cpython_results = run_cpython(test_file, tests, **kwargs)
-        dynamo_results = run_dynamo(test_file, tests, **kwargs)
+        if run_only_dynamo:
+            cpython_results = {test: [0.0, 0.0, 0.0] for test in tests}
+            dynamo_results = run_dynamo(test_file, tests, **kwargs)
+        else:
+            cpython_results = run_cpython(test_file, tests, **kwargs)
+            dynamo_results = run_dynamo(test_file, tests, **kwargs)
 
         assert len(cpython_results) == len(dynamo_results)
 
@@ -264,22 +295,22 @@ def main(
 
     df = pd.DataFrame(results)
 
-    if save:
-        # save result.csv
-        dump_result(df)
-        # save metadata
-        dump_metadata(**kwargs)
-
     if compare_with:
         baseline = pd.read_csv(compare_with)
         hash_baseline = compare_with.split("_")[-1].strip(".csv")
         compare_dataframes(
             baseline,
             df,
-            hash_baseline,
-            get_commit_hash(),
+            load_metadata(hash_baseline),
+            asdict(get_metadata(**kwargs)),
             verbose=kwargs.get("verbose", False),
         )
+    else:
+        rich.print(df)
+
+    if save:
+        save_result(df)
+        save_metadata(**kwargs)
 
 
 def get_test_files() -> list[str]:
@@ -311,10 +342,8 @@ def compare_files(baseline, file2, verbose=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run dynamo-bench tests.")
-    parser.add_argument(
-        "--all", action="store_true", default=False, help="Run all tests"
-    )
-    parser.add_argument("--single", type=str, help="Run a single test file")
+    parser.add_argument("--testfile", type=str, help="Run a single test file")
+    parser.add_argument("--testcase", type=str, help="Run a single test")
     parser.add_argument(
         "--list",
         action="store_true",
@@ -344,33 +373,40 @@ if __name__ == "__main__":
         type=str,
         help="Compare the latest result with a given result file",
     )
+    parser.add_argument(
+        "--run_only_dynamo",
+        action="store_true",
+        default=False,
+        help="Run only dynamo tests",
+    )
     args = parser.parse_args()
 
     if args.list:
         list_tests()
-    elif args.single:
-        assert args.single in get_test_files(), args.single
+    elif args.testfile:
+        assert args.testfile in get_test_files(), args.testfile
         main(
-            [args.single],
+            [args.testfile],
+            test_case=args.testcase,
             warmup=args.warmup,
             runs=args.runs,
             verbose=args.verbose,
-            save=args.save,
-            compare_with=args.compare_with,
-        )
-    elif args.all:
-        main(
-            get_test_files(),
-            warmup=args.warmup,
-            runs=args.runs,
-            verbose=args.verbose,
+            run_only_dynamo=args.run_only_dynamo,
             save=args.save,
             compare_with=args.compare_with,
         )
     elif args.compare:
         compare_files(args.compare[0], args.compare[1], verbose=args.verbose)
     else:
-        print("invalid call")
-        sys.exit(1)
-
-    # main()
+        print("running all tests")
+        assert args.testcase is None
+        main(
+            get_test_files(),
+            test_case=None,
+            warmup=args.warmup,
+            runs=args.runs,
+            run_only_dynamo=args.run_only_dynamo,
+            verbose=args.verbose,
+            save=args.save,
+            compare_with=args.compare_with,
+        )

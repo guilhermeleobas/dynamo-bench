@@ -1,10 +1,8 @@
-import os
 import pandas as pd
 import rich
 import statistics
 from dataclasses import dataclass
 from rich.table import Table
-import json
 
 
 @dataclass(frozen=True)
@@ -96,6 +94,7 @@ def merge_dataframes(df1, df2, verbose=False):
             ]
         )
 
+    merged = merged[merged.mean_ratio.isna() == False]
     merged.sort_values(by="mean_ratio", ascending=True, inplace=True)
     return merged
 
@@ -144,16 +143,10 @@ Summary:
     )
 
 
-def compare_dataframes(df1, df2, hash_1: str, hash_2: str, verbose=False):
+def compare_dataframes(df1, df2, meta1: dict, meta2: dict, verbose=False):
     merged = merge_dataframes(df1, df2, verbose=verbose)
     stats = compute_statistics(merged)
     compare_table = build_compare_table(merged)
 
-    p_baseline = f"{hash_1}_metadata.json"
-    p_new = f"{hash_2}_metadata.json"
-    metadata_table = build_metadata_table(
-        json.load(open(p_baseline)) if os.path.exists(p_baseline) else {},
-        json.load(open(p_new)) if os.path.exists(p_new) else {},
-    )
-
+    metadata_table = build_metadata_table(meta1, meta2)
     print_summary(compare_table, metadata_table, stats)
